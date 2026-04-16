@@ -1757,9 +1757,8 @@ app.use((error, req, res, next) => {
 });
 
 const port = parsePort(process.env.PORT, 8000);
-const host = String(process.env.HOST || "0.0.0.0").trim() || "0.0.0.0";
-const server = app.listen(port, host, () => {
-  console.log(`Ramy Node backend running on http://${host}:${port}`);
+const server = app.listen(port, () => {
+  console.log(`Ramy Node backend running on port ${port}`);
 });
 
 server.on("error", (error) => {
