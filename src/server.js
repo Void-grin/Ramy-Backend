@@ -205,7 +205,318 @@ function applyRuleCalibration(text, predictedClass, confidence, allScores = null
   };
 }
 
-function mockRuleClassify(text) {
+function buildRuleXai(text, predictedClass, topK = 8) {
+  const tokens = extractTextTokens(text);
+  const weighted = [];
+
+  tokens.forEach((token, index) => {
+    let score = 1 / (index + 1.5);
+    if (predictedClass === "negative" && (NEGATIVE_TOKENS.has(token) || NEGATION_TOKENS.has(token))) score += 1.4;
+    if (predictedClass === "positive" && POSITIVE_TOKENS.has(token)) score += 1.4;
+    if (predictedClass === "question" && QUESTION_TOKENS.has(token)) score += 1.2;
+    weighted.push([token, score]);
+  });
+
+  const merged = new Map();
+  for (const [token, score] of weighted) {
+    merged.set(token, Math.max(score, merged.get(token) || 0));
+  }
+
+  const sorted = [...merged.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, Math.max(1, Math.min(Number(topK || 8), 20)));
+
+  const total = sorted.reduce((acc, [, score]) => acc + Number(score || 0), 0) || 1;
+  const top_tokens = sorted.map(([token, score]) => [token, Number((score / total).toFixed(4))]);
+
+  return {
+    top_tokens,
+    explanation_text: top_tokens.length
+      ? `Top relative tokens for ${predictedClass}: ${top_tokens.map((entry) => `${entry[0]} (${Math.round(entry[1] * 100)}%)`).join(", ")}.`
+      : `No token-level clues were extracted for ${predictedClass}.`,
+    xai_method: "token-heuristic",
+  };
+}
+
+function normalizeTopTokens(rawTokens, topK = 8) {
+  if (!Array.isArray(rawTokens)) return [];
+
+  const normalized = [];
+  for (const entry of rawTokens) {
+    if (Array.isArray(entry) && entry.length >= 2) {
+      const token = String(entry[0] || "").trim();
+      const score = Number(entry[1]);
+      if (token && Number.isFinite(score) && score >= 0) {
+        normalized.push([token, score]);
+      }
+      continue;
+    }
+    if (entry && typeof entry === "object") {
+      const token = String(entry.token || entry.word || "").trim();
+      const score = Number(entry.score ?? entry.weight ?? entry.value ?? 0);
+      if (token && Number.isFinite(score) && score >= 0) {
+        normalized.push([token, score]);
+      }
+    }
+  }
+
+  const sorted = normalized
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+    .slice(0, Math.max(1, Math.min(Number(topK || 8), 20)));
+
+  const total = sorted.reduce((acc, [, score]) => acc + Number(score || 0), 0);
+  if (total <= 0) {
+    return sorted.map(([token]) => [token, Number((1 / sorted.length).toFixed(4))]);
+  }
+
+  return sorted.map(([token, score]) => [token, Number((Number(score || 0) / total).toFixed(4))]);
+}
+
+function extractJsonObject(text) {
+  const raw = String(text || "").trim();
+  if (!raw) throw new Error("Empty LLM response body.");
+
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const candidate = fenced?.[1] || raw;
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const first = candidate.indexOf("{");
+    const last = candidate.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      return JSON.parse(candidate.slice(first, last + 1));
+    }
+    throw new Error("Unable to parse JSON from LLM response.");
+  }
+}
+
+function buildLlmPrompt(text, includeXai = false, topK = 8) {
+  const xaiInstruction = includeXai
+    ? `Also include top_tokens as an array of [token, score] with ${topK} items max, and explanation_text in one short sentence.`
+    : "Set top_tokens to [] and explanation_text to ''.";
+
+  return [
+    "You are a strict JSON API for sentiment classification of Algerian Arabic, Darija, and French mixed customer comments.",
+    `Valid predicted_class values: ${TARGET_CLASSES.join(", ")}.`,
+    "Return JSON only with keys: predicted_class, confidence, all_scores, top_tokens, explanation_text, xai_method.",
+    "all_scores must include exactly these classes and sum approximately to 1.",
+    xaiInstruction,
+    `Comment: ${text}`,
+  ].join("\n");
+}
+
+function normalizeLlmPrediction(text, rawRow, options, providerId) {
+  const rawPred = String(rawRow?.predicted_class || rawRow?.label || "neutral").toLowerCase();
+  const rawConfidence = Number(rawRow?.confidence ?? rawRow?.score ?? 0.5);
+  const calibrated = applyRuleCalibration(text, rawPred, rawConfidence, rawRow?.all_scores || null);
+
+  let topTokens = [];
+  let explanationText = "";
+  let xaiMethod = "";
+
+  if (options.includeXai) {
+    topTokens = normalizeTopTokens(rawRow?.top_tokens || rawRow?.word_attributions || [], options.xaiTopK);
+    explanationText = String(rawRow?.explanation_text || "").trim();
+    xaiMethod = String(rawRow?.xai_method || "").trim() || `llm-${providerId}`;
+
+    if (!topTokens.length) {
+      const fallbackXai = buildRuleXai(text, calibrated.predictedClass, options.xaiTopK);
+      topTokens = fallbackXai.top_tokens;
+      if (!explanationText) explanationText = fallbackXai.explanation_text;
+      if (!xaiMethod) xaiMethod = fallbackXai.xai_method;
+    }
+  }
+
+  return {
+    text,
+    predicted_class: calibrated.predictedClass,
+    confidence: calibrated.confidence,
+    all_scores: calibrated.allScores,
+    calibration_rules: calibrated.calibrationRules,
+    top_tokens: topTokens,
+    explanation_text: explanationText,
+    xai_method: xaiMethod,
+    provider_id: providerId,
+  };
+}
+
+function buildLlmProviderChain() {
+  const providers = [];
+
+  const geminiPrimary = String(process.env.GEMINI_API_KEY_PRIMARY || "").trim();
+  const geminiSecondary = String(process.env.GEMINI_API_KEY_SECONDARY || "").trim();
+  const grokKey = String(process.env.GROK_API_KEY || "").trim();
+
+  const geminiModelPrimary = String(process.env.GEMINI_MODEL_PRIMARY || process.env.GEMINI_MODEL || "gemini-1.5-flash").trim();
+  const geminiModelSecondary = String(process.env.GEMINI_MODEL_SECONDARY || process.env.GEMINI_MODEL || "gemini-1.5-flash").trim();
+  const grokModel = String(process.env.GROK_MODEL || "grok-2-latest").trim();
+
+  if (geminiPrimary) {
+    providers.push({ id: "gemini-primary", type: "gemini", apiKey: geminiPrimary, model: geminiModelPrimary });
+  }
+  if (geminiSecondary) {
+    providers.push({ id: "gemini-secondary", type: "gemini", apiKey: geminiSecondary, model: geminiModelSecondary });
+  }
+  if (grokKey) {
+    providers.push({ id: "grok", type: "grok", apiKey: grokKey, model: grokModel });
+  }
+
+  const customUrl = String(process.env.LLM_API_URL || "").trim();
+  if (customUrl) {
+    providers.push({ id: "custom", type: "custom", url: customUrl });
+  }
+
+  return providers;
+}
+
+async function callGeminiProvider(provider, text, options) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(provider.model)}:generateContent?key=${encodeURIComponent(provider.apiKey)}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: buildLlmPrompt(text, options.includeXai, options.xaiTopK) }] }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
+
+  const bodyText = await response.text();
+  let payload = {};
+  try {
+    payload = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    // Keep raw body fallback.
+  }
+
+  if (!response.ok) {
+    const detail = payload?.error?.message || payload?.detail || `Gemini failed (${response.status})`;
+    const err = new Error(detail);
+    err.status = response.status;
+    throw err;
+  }
+
+  const contentText = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!contentText) {
+    const err = new Error("Gemini response is missing content text.");
+    err.status = response.status;
+    throw err;
+  }
+  return extractJsonObject(contentText);
+}
+
+async function callGrokProvider(provider, text, options) {
+  const endpoint = String(process.env.GROK_API_URL || "https://api.x.ai/v1/chat/completions").trim();
+  const prompt = buildLlmPrompt(text, options.includeXai, options.xaiTopK);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${provider.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: "You only return strict JSON responses." },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
+
+  const bodyText = await response.text();
+  let payload = {};
+  try {
+    payload = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    // Keep raw body fallback.
+  }
+
+  if (!response.ok) {
+    const detail = payload?.error?.message || payload?.detail || `Grok failed (${response.status})`;
+    const err = new Error(detail);
+    err.status = response.status;
+    throw err;
+  }
+
+  const contentText = payload?.choices?.[0]?.message?.content;
+  if (!contentText) {
+    const err = new Error("Grok response is missing message content.");
+    err.status = response.status;
+    throw err;
+  }
+
+  return extractJsonObject(contentText);
+}
+
+async function callCustomProvider(provider, text, options) {
+  const headers = { "Content-Type": "application/json" };
+  const apiKey = String(process.env.LLM_API_KEY || "").trim();
+  const apiKeyHeader = String(process.env.LLM_API_KEY_HEADER || "Authorization").trim();
+
+  if (apiKey) {
+    headers[apiKeyHeader] = apiKeyHeader.toLowerCase() === "authorization" && !apiKey.toLowerCase().startsWith("bearer ")
+      ? `Bearer ${apiKey}`
+      : apiKey;
+  }
+
+  const response = await fetch(provider.url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: String(process.env.LLM_MODEL || "").trim() || undefined,
+      task: "sentiment-classification",
+      target_classes: TARGET_CLASSES,
+      comments: [text],
+      include_xai: options.includeXai,
+      xai_top_k: options.xaiTopK,
+    }),
+  });
+
+  const bodyText = await response.text();
+  let payload = {};
+  try {
+    payload = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    // Keep raw body fallback.
+  }
+
+  if (!response.ok) {
+    const detail = payload?.detail || payload?.error || `Custom LLM failed (${response.status})`;
+    const err = new Error(detail);
+    err.status = response.status;
+    throw err;
+  }
+
+  const row = Array.isArray(payload?.rows) ? payload.rows[0] : Array.isArray(payload?.predictions) ? payload.predictions[0] : null;
+  if (!row || typeof row !== "object") {
+    throw new Error("Custom LLM response must include rows[0] or predictions[0].");
+  }
+  return row;
+}
+
+async function callLlmProvider(provider, text, options) {
+  if (provider.type === "gemini") return callGeminiProvider(provider, text, options);
+  if (provider.type === "grok") return callGrokProvider(provider, text, options);
+  return callCustomProvider(provider, text, options);
+}
+
+function isRateLimitLike(error) {
+  const message = String(error?.message || "").toLowerCase();
+  const status = Number(error?.status || 0);
+  return status === 429
+    || message.includes("quota")
+    || message.includes("rate limit")
+    || message.includes("resource exhausted")
+    || message.includes("too many requests");
+}
+
+function mockRuleClassify(text, options = {}) {
   const normalized = String(text || "").toLowerCase();
   const patterns = [
     { cls: "negative", keys: ["mauvais", "trop cher", "khayeb", "Ø±Ø¯ÙŠØ¡", "bad", "zero", "ghali"] },
@@ -232,95 +543,85 @@ function mockRuleClassify(text) {
   if (predicted === "question") baseScores.improvement = 0.11;
 
   const calibrated = applyRuleCalibration(text, predicted, Number(baseScores[predicted] || 0.66), baseScores);
-  return {
+  const row = {
     text,
     predicted_class: calibrated.predictedClass,
     confidence: calibrated.confidence,
     all_scores: calibrated.allScores,
     calibration_rules: calibrated.calibrationRules,
-  };
-}
-
-async function predictWithLlmProvider(comments) {
-  const url = String(process.env.LLM_API_URL || "").trim();
-  if (!url) {
-    throw new Error("LLM_API_URL is not configured.");
-  }
-
-  const headers = { "Content-Type": "application/json" };
-  const apiKey = String(process.env.LLM_API_KEY || "").trim();
-  const apiKeyHeader = String(process.env.LLM_API_KEY_HEADER || "Authorization").trim();
-
-  if (apiKey) {
-    headers[apiKeyHeader] = apiKeyHeader.toLowerCase() === "authorization" && !apiKey.toLowerCase().startsWith("bearer ")
-      ? `Bearer ${apiKey}`
-      : apiKey;
-  }
-
-  const payload = {
-    model: String(process.env.LLM_MODEL || "").trim() || undefined,
-    task: "sentiment-classification",
-    target_classes: TARGET_CLASSES,
-    comments,
+    top_tokens: [],
+    explanation_text: "",
+    xai_method: "",
   };
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  });
-
-  const rawText = await response.text();
-  let data = {};
-  try {
-    data = rawText ? JSON.parse(rawText) : {};
-  } catch (error) {
-    throw new Error(`Invalid JSON returned by LLM API: ${error.message}`);
+  if (options.includeXai) {
+    const xai = buildRuleXai(text, calibrated.predictedClass, options.xaiTopK);
+    row.top_tokens = xai.top_tokens;
+    row.explanation_text = xai.explanation_text;
+    row.xai_method = xai.xai_method;
   }
 
-  if (!response.ok) {
-    throw new Error(data?.detail || data?.error || `LLM API failed (${response.status})`);
-  }
-
-  const sourceRows = Array.isArray(data?.rows)
-    ? data.rows
-    : Array.isArray(data?.predictions)
-      ? data.predictions
-      : [];
-
-  if (!Array.isArray(sourceRows) || sourceRows.length !== comments.length) {
-    throw new Error("LLM API response must include rows[] matching the number of comments.");
-  }
-
-  return comments.map((text, index) => {
-    const row = sourceRows[index] || {};
-    const rawPred = String(row.predicted_class || row.label || "neutral").toLowerCase();
-    const rawConfidence = Number(row.confidence ?? row.score ?? 0.5);
-    const calibrated = applyRuleCalibration(text, rawPred, rawConfidence, row.all_scores || null);
-    return {
-      text,
-      predicted_class: calibrated.predictedClass,
-      confidence: calibrated.confidence,
-      all_scores: calibrated.allScores,
-      calibration_rules: calibrated.calibrationRules,
-    };
-  });
+  return row;
 }
 
-async function predictComments(comments) {
+async function predictWithLlmProvider(comments, options = {}) {
+  const maxBatch = Math.max(1, Math.min(500, Number(process.env.LLM_MAX_BATCH || 120)));
+  if (comments.length > maxBatch) {
+    throw new Error(`LLM batch limit exceeded (${comments.length}). Max allowed is ${maxBatch}.`);
+  }
+
+  const providers = buildLlmProviderChain();
+  if (!providers.length) {
+    throw new Error("No LLM providers configured. Set GEMINI_API_KEY_PRIMARY / GEMINI_API_KEY_SECONDARY / GROK_API_KEY.");
+  }
+
+  const rows = [];
+  let preferredProviderIndex = 0;
+
+  for (const text of comments) {
+    let resolved = null;
+    let lastError = null;
+
+    for (let index = preferredProviderIndex; index < providers.length; index += 1) {
+      const provider = providers[index];
+      try {
+        const rawPrediction = await callLlmProvider(provider, text, options);
+        resolved = normalizeLlmPrediction(text, rawPrediction, options, provider.id);
+        preferredProviderIndex = index;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (isRateLimitLike(error)) {
+          preferredProviderIndex = Math.min(index + 1, providers.length - 1);
+        }
+      }
+    }
+
+    if (!resolved) {
+      const detail = String(lastError?.message || "Unknown LLM provider error");
+      throw new Error(`All configured LLM providers failed. Last error: ${detail}`);
+    }
+
+    rows.push(resolved);
+  }
+
+  return rows;
+}
+
+async function predictComments(comments, options = {}) {
   const provider = String(process.env.CLASSIFIER_PROVIDER || "rule").trim().toLowerCase();
   if (provider === "llm") {
     try {
-      return await predictWithLlmProvider(comments);
+      return await predictWithLlmProvider(comments, options);
     } catch (error) {
       return comments.map((text) => ({
-        ...mockRuleClassify(text),
+        ...mockRuleClassify(text, options),
         provider_error: String(error.message || error),
       }));
     }
   }
 
-  return comments.map((text) => mockRuleClassify(text));
+  return comments.map((text) => mockRuleClassify(text, options));
 }
 
 function classifyCatalog(product, text = "") {
@@ -950,13 +1251,16 @@ app.get("/api/health", (req, res) => {
 
 app.get("/api/model/status", (req, res) => {
   const provider = String(process.env.CLASSIFIER_PROVIDER || "rule").toLowerCase();
+  const llmChain = provider === "llm" ? buildLlmProviderChain().map((entry) => entry.id) : [];
+  const ready = provider === "llm" ? llmChain.length > 0 : true;
   res.json({
-    ready: true,
+    ready,
     provider,
-    model_dir: provider === "llm" ? String(process.env.LLM_API_URL || "") : "rule-based-classifier",
-    error: "",
-    xai_ready: false,
-    xai_error: "XAI disabled in Node backend.",
+    llm_chain: llmChain,
+    model_dir: provider === "llm" ? llmChain.join(" -> ") : "rule-based-classifier",
+    error: ready ? "" : "No LLM provider configured. Add Gemini/Grok keys in backend .env",
+    xai_ready: provider === "llm",
+    xai_error: provider === "llm" ? "" : "XAI is only enabled for LLM provider mode.",
   });
 });
 
@@ -984,12 +1288,23 @@ app.post("/api/model/predict", asyncRoute(async (req, res) => {
     return res.status(400).json({ detail: "Too many comments. Max allowed is 1000." });
   }
 
-  const rows = await predictComments(comments);
+  const includeXai = toBool(req.body?.include_xai, false);
+  const xaiTopKRaw = Number(req.body?.xai_top_k ?? 8);
+  const xaiTopK = Number.isFinite(xaiTopKRaw) ? Math.max(1, Math.min(20, xaiTopKRaw)) : 8;
+
+  const rows = await predictComments(comments, {
+    includeXai,
+    xaiTopK,
+  });
+
   const distribution = rows.reduce((acc, row) => {
     const cls = String(row.predicted_class || "unknown");
     acc[cls] = (acc[cls] || 0) + 1;
     return acc;
   }, {});
+
+  const xaiUsed = includeXai && rows.some((row) => Array.isArray(row.top_tokens) && row.top_tokens.length > 0);
+  const firstXaiMethod = rows.find((row) => row.xai_method)?.xai_method || "";
 
   res.json({
     total: rows.length,
@@ -999,9 +1314,9 @@ app.post("/api/model/predict", asyncRoute(async (req, res) => {
     })),
     distribution,
     model_dir: String(process.env.CLASSIFIER_PROVIDER || "rule"),
-    xai_used: false,
-    xai_method: "",
-    xai_error: "",
+    xai_used: xaiUsed,
+    xai_method: xaiUsed ? firstXaiMethod : "",
+    xai_error: includeXai && !xaiUsed ? "XAI was requested but no attribution was produced." : "",
   });
 }));
 
