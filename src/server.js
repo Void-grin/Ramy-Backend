@@ -105,6 +105,15 @@ function toBool(value, defaultValue = false) {
   return defaultValue;
 }
 
+function parsePort(value, fallback = 8000) {
+  const raw = String(value ?? "").trim().replace(/^['\"]|['\"]$/g, "");
+  const numeric = Number.parseInt(raw, 10);
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= 65535) {
+    return numeric;
+  }
+  return fallback;
+}
+
 function extractTextTokens(text) {
   return String(text || "").toLowerCase().match(/[A-Za-z0-9_]+|[\u0600-\u06FF]+/g) || [];
 }
@@ -1739,7 +1748,13 @@ app.use((error, req, res, next) => {
   res.status(statusCode).json({ detail });
 });
 
-const port = Number(process.env.PORT || 8000);
-app.listen(port, () => {
-  console.log(`Ramy Node backend running on http://127.0.0.1:${port}`);
+const port = parsePort(process.env.PORT, 8000);
+const host = String(process.env.HOST || "0.0.0.0").trim() || "0.0.0.0";
+const server = app.listen(port, host, () => {
+  console.log(`Ramy Node backend running on http://${host}:${port}`);
+});
+
+server.on("error", (error) => {
+  console.error("Server failed to start:", error);
+  process.exit(1);
 });
