@@ -1272,6 +1272,14 @@ const asyncRoute = (handler) => (req, res, next) => {
   Promise.resolve(handler(req, res, next)).catch(next);
 };
 
+app.get("/", (req, res) => {
+  res.json({
+    service: "ramy-backend",
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
