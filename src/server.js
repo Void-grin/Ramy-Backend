@@ -25,6 +25,13 @@ const SOCIAL_CONFIG_PATH = path.resolve(ROOT_DIR, "config", "social_connectors.j
 const SOCIAL_STREAM_PATH = path.resolve(ROOT_DIR, "data", "processed", "social_stream_predictions.csv");
 const SOCIAL_PLATFORMS = ["facebook", "instagram", "tiktok"];
 const TARGET_CLASSES = ["positive", "negative", "neutral", "improvement", "question"];
+const DEFAULT_CORS_ORIGINS = [
+  "http://127.0.0.1:8000",
+  "http://localhost:8000",
+  "http://127.0.0.1:8010",
+  "http://localhost:8010",
+  "https://ramy-web-one.vercel.app",
+];
 
 const CATALOG = {
   "Boisson aux fruits": ["Classique", "EXTRA", "Frutty", "carton", "canette", "kids"],
@@ -59,7 +66,28 @@ const reviewCache = {
 const app = express();
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
-app.use(cors());
+function getAllowedCorsOrigins() {
+  const raw = String(process.env.CORS_ALLOW_ORIGINS || "").trim();
+  if (!raw) return [...DEFAULT_CORS_ORIGINS];
+  return [...new Set(raw.split(",").map((item) => item.trim()).filter(Boolean))];
+}
+
+const allowedCorsOrigins = getAllowedCorsOrigins();
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedCorsOrigins.includes("*") || allowedCorsOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "8mb" }));
 app.use(express.urlencoded({ extended: true, limit: "8mb" }));
 
