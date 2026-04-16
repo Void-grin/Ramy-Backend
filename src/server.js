@@ -114,6 +114,98 @@ function parsePort(value, fallback = 8000) {
   return fallback;
 }
 
+const GENERIC_LLM_FAILURE_DETAIL = "Prediction service is temporarily busy. Please try again shortly.";
+let lastLlmRequestAtMs = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))));
+}
+
+function readEnvInt(name, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  const raw = String(process.env[name] ?? "").trim().replace(/^['\"]|['\"]$/g, "");
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20_000) {
+  const safeTimeoutMs = Math.max(1_000, Number(timeoutMs || 20_000));
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), safeTimeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(`Provider request timeout after ${safeTimeoutMs} ms`);
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function parseRetryAfterHeader(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+
+  const numericSeconds = Number.parseFloat(raw);
+  if (Number.isFinite(numericSeconds) && numericSeconds >= 0) {
+    return Math.round(numericSeconds * 1000);
+  }
+
+  const retryAt = Date.parse(raw);
+  if (!Number.isNaN(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return 0;
+}
+
+function parseRetryDelayFromMessage(message) {
+  const text = String(message || "");
+  const secondsMatch = text.match(/retry\s+in\s+([0-9]+(?:\.[0-9]+)?)s/i);
+  if (secondsMatch) {
+    const seconds = Number.parseFloat(secondsMatch[1]);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.round(seconds * 1000);
+    }
+  }
+  return 0;
+}
+
+function attachProviderErrorMetadata(error, providerId, retryAfterMs = 0) {
+  error.isLlmProviderFailure = true;
+  error.providerId = providerId;
+  error.publicDetail = GENERIC_LLM_FAILURE_DETAIL;
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+    error.retryAfterMs = retryAfterMs;
+  }
+  return error;
+}
+
+function getPublicApiError(error, fallbackStatus = 503, fallbackDetail = "Service temporarily unavailable.") {
+  const status = Number(error?.publicStatus || error?.status || fallbackStatus);
+  const detail = String(error?.publicDetail || fallbackDetail);
+  return {
+    status: Number.isFinite(status) ? Math.max(400, Math.min(599, status)) : fallbackStatus,
+    detail,
+  };
+}
+
+async function applyLlmThrottleDelay() {
+  const minIntervalMs = readEnvInt("LLM_MIN_REQUEST_INTERVAL_MS", 300, 0, 60_000);
+  if (minIntervalMs <= 0) return;
+
+  const waitMs = Math.max(0, (lastLlmRequestAtMs + minIntervalMs) - Date.now());
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+  lastLlmRequestAtMs = Date.now();
+}
+
 function extractTextTokens(text) {
   return String(text || "").toLowerCase().match(/[A-Za-z0-9_]+|[\u0600-\u06FF]+/g) || [];
 }
@@ -410,8 +502,9 @@ function buildLlmProviderChain() {
 
 async function callGeminiProvider(provider, text, options) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(provider.model)}:generateContent?key=${encodeURIComponent(provider.apiKey)}`;
+  const timeoutMs = readEnvInt("LLM_PROVIDER_TIMEOUT_MS", 20_000, 1_000, 180_000);
 
-  const response = await fetch(endpoint, {
+  const response = await fetchWithTimeout(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -421,7 +514,7 @@ async function callGeminiProvider(provider, text, options) {
         responseMimeType: "application/json",
       },
     }),
-  });
+  }, timeoutMs);
 
   const bodyText = await response.text();
   let payload = {};
@@ -435,7 +528,11 @@ async function callGeminiProvider(provider, text, options) {
     const detail = payload?.error?.message || payload?.detail || `Gemini failed (${response.status})`;
     const err = new Error(detail);
     err.status = response.status;
-    throw err;
+    const retryAfterMs = Math.max(
+      parseRetryAfterHeader(response.headers.get("retry-after")),
+      parseRetryDelayFromMessage(detail),
+    );
+    throw attachProviderErrorMetadata(err, provider.id, retryAfterMs);
   }
 
   const contentText = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -450,8 +547,9 @@ async function callGeminiProvider(provider, text, options) {
 async function callGrokProvider(provider, text, options) {
   const endpoint = String(process.env.GROK_API_URL || "https://api.x.ai/v1/chat/completions").trim();
   const prompt = buildLlmPrompt(text, options.includeXai, options.xaiTopK);
+  const timeoutMs = readEnvInt("LLM_PROVIDER_TIMEOUT_MS", 20_000, 1_000, 180_000);
 
-  const response = await fetch(endpoint, {
+  const response = await fetchWithTimeout(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -465,7 +563,7 @@ async function callGrokProvider(provider, text, options) {
         { role: "user", content: prompt },
       ],
     }),
-  });
+  }, timeoutMs);
 
   const bodyText = await response.text();
   let payload = {};
@@ -479,7 +577,11 @@ async function callGrokProvider(provider, text, options) {
     const detail = payload?.error?.message || payload?.detail || `Grok failed (${response.status})`;
     const err = new Error(detail);
     err.status = response.status;
-    throw err;
+    const retryAfterMs = Math.max(
+      parseRetryAfterHeader(response.headers.get("retry-after")),
+      parseRetryDelayFromMessage(detail),
+    );
+    throw attachProviderErrorMetadata(err, provider.id, retryAfterMs);
   }
 
   const contentText = payload?.choices?.[0]?.message?.content;
@@ -503,7 +605,9 @@ async function callCustomProvider(provider, text, options) {
       : apiKey;
   }
 
-  const response = await fetch(provider.url, {
+  const timeoutMs = readEnvInt("LLM_PROVIDER_TIMEOUT_MS", 20_000, 1_000, 180_000);
+
+  const response = await fetchWithTimeout(provider.url, {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -514,7 +618,7 @@ async function callCustomProvider(provider, text, options) {
       include_xai: options.includeXai,
       xai_top_k: options.xaiTopK,
     }),
-  });
+  }, timeoutMs);
 
   const bodyText = await response.text();
   let payload = {};
@@ -528,7 +632,11 @@ async function callCustomProvider(provider, text, options) {
     const detail = payload?.detail || payload?.error || `Custom LLM failed (${response.status})`;
     const err = new Error(detail);
     err.status = response.status;
-    throw err;
+    const retryAfterMs = Math.max(
+      parseRetryAfterHeader(response.headers.get("retry-after")),
+      parseRetryDelayFromMessage(detail),
+    );
+    throw attachProviderErrorMetadata(err, provider.id, retryAfterMs);
   }
 
   const row = Array.isArray(payload?.rows) ? payload.rows[0] : Array.isArray(payload?.predictions) ? payload.predictions[0] : null;
@@ -552,6 +660,33 @@ function isRateLimitLike(error) {
     || message.includes("rate limit")
     || message.includes("resource exhausted")
     || message.includes("too many requests");
+}
+
+async function callLlmProviderWithRetry(provider, text, options) {
+  const retries = readEnvInt("LLM_PROVIDER_RETRY_COUNT", 0, 0, 5);
+  const baseDelayMs = readEnvInt("LLM_PROVIDER_RETRY_DELAY_MS", 700, 200, 60_000);
+  const maxRetryWaitMs = readEnvInt("LLM_MAX_RETRY_WAIT_MS", 4_000, 500, 60_000);
+
+  let attempt = 0;
+  while (true) {
+    await applyLlmThrottleDelay();
+
+    try {
+      return await callLlmProvider(provider, text, options);
+    } catch (error) {
+      const shouldRetry = isRateLimitLike(error) && attempt < retries;
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      const retryDelayMs = Math.max(
+        Number(error?.retryAfterMs || 0),
+        baseDelayMs * (attempt + 1),
+      );
+      await sleep(Math.min(maxRetryWaitMs, retryDelayMs));
+      attempt += 1;
+    }
+  }
 }
 
 function mockRuleClassify(text, options = {}) {
@@ -615,6 +750,7 @@ async function predictWithLlmProvider(comments, options = {}) {
 
   const rows = [];
   let preferredProviderIndex = 0;
+  const providerErrors = [];
 
   for (const text of comments) {
     let resolved = null;
@@ -623,12 +759,13 @@ async function predictWithLlmProvider(comments, options = {}) {
     for (let index = preferredProviderIndex; index < providers.length; index += 1) {
       const provider = providers[index];
       try {
-        const rawPrediction = await callLlmProvider(provider, text, options);
+        const rawPrediction = await callLlmProviderWithRetry(provider, text, options);
         resolved = normalizeLlmPrediction(text, rawPrediction, options, provider.id);
         preferredProviderIndex = index;
         break;
       } catch (error) {
         lastError = error;
+        providerErrors.push(`[${provider.id}] ${String(error?.message || error)}`);
         if (isRateLimitLike(error)) {
           preferredProviderIndex = Math.min(index + 1, providers.length - 1);
         }
@@ -637,7 +774,11 @@ async function predictWithLlmProvider(comments, options = {}) {
 
     if (!resolved) {
       const detail = String(lastError?.message || "Unknown LLM provider error");
-      throw new Error(`All configured LLM providers failed. Last error: ${detail}`);
+      const err = new Error(`All configured LLM providers failed. Last error: ${detail}`);
+      err.isLlmProviderFailure = true;
+      err.publicDetail = GENERIC_LLM_FAILURE_DETAIL;
+      err.providerErrors = providerErrors.slice(-8);
+      throw err;
     }
 
     rows.push(resolved);
@@ -1338,7 +1479,12 @@ app.post("/api/model/predict", asyncRoute(async (req, res) => {
       xaiTopK,
     });
   } catch (error) {
-    return res.status(503).json({ detail: String(error.message || error) });
+    if (error?.providerErrors?.length) {
+      console.error("[LLM providers]", error.providerErrors.join(" | "));
+    }
+    console.error("[Predict error]", String(error?.stack || error?.message || error));
+    const publicErr = getPublicApiError(error, 503, "Prediction service is temporarily unavailable.");
+    return res.status(publicErr.status).json({ detail: publicErr.detail });
   }
 
   const distribution = rows.reduce((acc, row) => {
@@ -1412,7 +1558,12 @@ app.post("/api/model/predict-file", upload.single("file"), asyncRoute(async (req
   try {
     predictions = await predictComments(comments, { includeXai: false, xaiTopK: 8 });
   } catch (error) {
-    return res.status(503).json({ detail: String(error.message || error) });
+    if (error?.providerErrors?.length) {
+      console.error("[LLM providers]", error.providerErrors.join(" | "));
+    }
+    console.error("[Predict-file error]", String(error?.stack || error?.message || error));
+    const publicErr = getPublicApiError(error, 503, "Prediction service is temporarily unavailable.");
+    return res.status(publicErr.status).json({ detail: publicErr.detail });
   }
   const outRows = rows.map((row) => ({ ...row }));
   for (let i = 0; i < predictions.length; i += 1) {
