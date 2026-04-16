@@ -343,6 +343,7 @@ function normalizeLlmPrediction(text, rawRow, options, providerId) {
 
 function buildLlmProviderChain() {
   const providers = [];
+  const onlyGemini = toBool(process.env.LLM_ONLY_GEMINI, true);
 
   const geminiPrimary = String(process.env.GEMINI_API_KEY_PRIMARY || "").trim();
   const geminiSecondary = String(process.env.GEMINI_API_KEY_SECONDARY || "").trim();
@@ -358,12 +359,12 @@ function buildLlmProviderChain() {
   if (geminiSecondary) {
     providers.push({ id: "gemini-secondary", type: "gemini", apiKey: geminiSecondary, model: geminiModelSecondary });
   }
-  if (grokKey) {
+  if (!onlyGemini && grokKey) {
     providers.push({ id: "grok", type: "grok", apiKey: grokKey, model: grokModel });
   }
 
   const customUrl = String(process.env.LLM_API_URL || "").trim();
-  if (customUrl) {
+  if (!onlyGemini && customUrl) {
     providers.push({ id: "custom", type: "custom", url: customUrl });
   }
 
@@ -611,14 +612,7 @@ async function predictWithLlmProvider(comments, options = {}) {
 async function predictComments(comments, options = {}) {
   const provider = String(process.env.CLASSIFIER_PROVIDER || "rule").trim().toLowerCase();
   if (provider === "llm") {
-    try {
-      return await predictWithLlmProvider(comments, options);
-    } catch (error) {
-      return comments.map((text) => ({
-        ...mockRuleClassify(text, options),
-        provider_error: String(error.message || error),
-      }));
-    }
+    return await predictWithLlmProvider(comments, options);
   }
 
   return comments.map((text) => mockRuleClassify(text, options));
@@ -1292,10 +1286,15 @@ app.post("/api/model/predict", asyncRoute(async (req, res) => {
   const xaiTopKRaw = Number(req.body?.xai_top_k ?? 8);
   const xaiTopK = Number.isFinite(xaiTopKRaw) ? Math.max(1, Math.min(20, xaiTopKRaw)) : 8;
 
-  const rows = await predictComments(comments, {
-    includeXai,
-    xaiTopK,
-  });
+  let rows = [];
+  try {
+    rows = await predictComments(comments, {
+      includeXai,
+      xaiTopK,
+    });
+  } catch (error) {
+    return res.status(503).json({ detail: String(error.message || error) });
+  }
 
   const distribution = rows.reduce((acc, row) => {
     const cls = String(row.predicted_class || "unknown");
@@ -1364,7 +1363,12 @@ app.post("/api/model/predict-file", upload.single("file"), asyncRoute(async (req
     return res.status(400).json({ detail: "Too many rows to analyze. Max allowed is 2000." });
   }
 
-  const predictions = await predictComments(comments);
+  let predictions = [];
+  try {
+    predictions = await predictComments(comments, { includeXai: false, xaiTopK: 8 });
+  } catch (error) {
+    return res.status(503).json({ detail: String(error.message || error) });
+  }
   const outRows = rows.map((row) => ({ ...row }));
   for (let i = 0; i < predictions.length; i += 1) {
     const targetIndex = validIndices[i];

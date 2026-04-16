@@ -38,6 +38,7 @@ Failover order is:
 
 Recommended variables:
 
+- `LLM_ONLY_GEMINI=true`
 - `GEMINI_API_KEY_PRIMARY=...`
 - `GEMINI_MODEL_PRIMARY=gemini-1.5-flash`
 - `GEMINI_API_KEY_SECONDARY=...`
@@ -71,3 +72,11 @@ Health checks:
 
 - `GET /api/health`
 - `GET /api/model/status`
+
+XAI test request:
+
+```bash
+curl -X POST http://127.0.0.1:8010/api/model/predict \
+	-H "Content-Type: application/json" \
+	-d '{"comments":["ramy bnin bzf"],"include_xai":true,"xai_top_k":8}'
+```
