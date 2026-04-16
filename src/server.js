@@ -1,0 +1,1398 @@
+﻿import crypto from "crypto";
+import fs from "fs/promises";
+import fsSync from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+import cors from "cors";
+import dotenv from "dotenv";
+import express from "express";
+import multer from "multer";
+import Papa from "papaparse";
+import XLSX from "xlsx";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const BACKEND_DIR = path.resolve(__dirname, "..");
+const ROOT_DIR = path.resolve(BACKEND_DIR, "..");
+
+dotenv.config({ path: path.resolve(BACKEND_DIR, ".env") });
+
+dotenv.config();
+
+const DEFAULT_DATA_PATH = path.resolve(ROOT_DIR, "data", "augmented", "Ramy_data_augmented_target_1500.csv");
+const SOCIAL_CONFIG_PATH = path.resolve(ROOT_DIR, "config", "social_connectors.json");
+const SOCIAL_STREAM_PATH = path.resolve(ROOT_DIR, "data", "processed", "social_stream_predictions.csv");
+const SOCIAL_PLATFORMS = ["facebook", "instagram", "tiktok"];
+const TARGET_CLASSES = ["positive", "negative", "neutral", "improvement", "question"];
+
+const CATALOG = {
+  "Boisson aux fruits": ["Classique", "EXTRA", "Frutty", "carton", "canette", "kids"],
+  "Boisson gazÃ©ifiÃ©e": ["Water Fruits", "Boisson gazeifiÃ©e canette", "Boisson gazeifiÃ©e verre"],
+  "Boisson au lait": ["milky : 1l", "milky : 20cl", "milky : 300ml", "milky : 25cl"],
+  "Produits laitiers": ["lais", "yupty", "raib et lben", "cherebt", "ramy up duo"],
+};
+
+const QUESTION_TOKENS = new Set([
+  "wach", "wesh", "wash", "win", "where", "ou", "pourquoi", "why", "comment", "how",
+  "when", "what", "quoi", "fin", "kayen", "kayn", "Ø¹Ù„Ø§Ù‡", "ÙƒÙŠÙ", "ÙÙŠÙ†", "ÙˆÙŠÙ†", "Ù…ØªÙ‰", "ÙˆØ´",
+]);
+
+const NEGATION_TOKENS = new Set([
+  "machi", "moch", "Ù…Ø´", "Ù…Ø§Ø´ÙŠ", "Ù…ÙˆØ´", "pas", "not", "jamais",
+]);
+
+const POSITIVE_TOKENS = new Set([
+  "bnin", "bnina", "bninaa", "bon", "good", "excellent", "super", "top", "Ù…Ù„ÙŠØ­", "Ø¨Ù†ÙŠÙ†", "Ù„Ø°ÙŠØ°",
+]);
+
+const NEGATIVE_TOKENS = new Set([
+  "khayeb", "khayba", "mauvais", "bad", "ghali", "cher", "trop", "Ø±Ø¯ÙŠØ¡", "Ø³ÙŠØ¡", "Ø®Ø§ÙŠØ¨", "ØºØ§Ù„ÙŠ",
+]);
+
+const reviewCache = {
+  path: "",
+  mtimeMs: 0,
+  rows: [],
+};
+
+const app = express();
+const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
+
+app.use(cors());
+app.use(express.json({ limit: "8mb" }));
+app.use(express.urlencoded({ extended: true, limit: "8mb" }));
+
+function resolveDataPath() {
+  const configured = String(process.env.REVIEW_DATA_PATH || "").trim();
+  if (!configured) return DEFAULT_DATA_PATH;
+  if (path.isAbsolute(configured)) return configured;
+  return path.resolve(BACKEND_DIR, configured);
+}
+
+function toBool(value, defaultValue = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") return ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+  return defaultValue;
+}
+
+function extractTextTokens(text) {
+  return String(text || "").toLowerCase().match(/[A-Za-z0-9_]+|[\u0600-\u06FF]+/g) || [];
+}
+
+function normalizeScoreMap(predictedClass, confidence, allScores = null) {
+  const scores = Object.fromEntries(TARGET_CLASSES.map((cls) => [cls, 0]));
+
+  if (allScores && typeof allScores === "object") {
+    for (const [key, value] of Object.entries(allScores)) {
+      const normalizedKey = String(key || "").toLowerCase();
+      if (normalizedKey in scores) {
+        const numeric = Number(value);
+        scores[normalizedKey] = Number.isFinite(numeric) ? Math.max(0, numeric) : 0;
+      }
+    }
+  }
+
+  let total = Object.values(scores).reduce((acc, value) => acc + value, 0);
+  let pred = String(predictedClass || "").toLowerCase();
+  const conf = Math.max(0, Math.min(Number(confidence || 0), 1));
+
+  if (total <= 0) {
+    if (!(pred in scores)) pred = "neutral";
+    const remainder = Math.max(0, 1 - conf);
+    const spread = remainder / (TARGET_CLASSES.length - 1);
+    for (const cls of TARGET_CLASSES) {
+      scores[cls] = cls === pred ? conf : spread;
+    }
+    total = Object.values(scores).reduce((acc, value) => acc + value, 0);
+  }
+
+  if (total > 0) {
+    for (const cls of TARGET_CLASSES) {
+      scores[cls] = scores[cls] / total;
+    }
+  }
+
+  return scores;
+}
+
+function boostClass(scores, target, floor) {
+  const safeFloor = Math.max(0, Math.min(Number(floor || 0), 1));
+  const current = Number(scores[target] || 0);
+  if (current >= safeFloor) {
+    const total = Object.values(scores).reduce((acc, value) => acc + Number(value || 0), 0);
+    if (total > 0) {
+      const normalized = {};
+      for (const [key, value] of Object.entries(scores)) {
+        normalized[key] = Number(value || 0) / total;
+      }
+      return normalized;
+    }
+    return scores;
+  }
+
+  const remain = Math.max(0, 1 - safeFloor);
+  const otherTotal = Math.max(1e-12, Object.entries(scores)
+    .filter(([key]) => key !== target)
+    .reduce((acc, [, value]) => acc + Number(value || 0), 0));
+
+  const boosted = {};
+  for (const [key, value] of Object.entries(scores)) {
+    if (key === target) {
+      boosted[key] = safeFloor;
+    } else {
+      boosted[key] = remain * (Number(value || 0) / otherTotal);
+    }
+  }
+
+  const total = Object.values(boosted).reduce((acc, value) => acc + Number(value || 0), 0);
+  if (total > 0) {
+    for (const key of Object.keys(boosted)) {
+      boosted[key] = boosted[key] / total;
+    }
+  }
+
+  return boosted;
+}
+
+function applyRuleCalibration(text, predictedClass, confidence, allScores = null) {
+  const tokens = extractTextTokens(text);
+  const tokenSet = new Set(tokens);
+  const raw = String(text || "").toLowerCase();
+
+  const hasQuestionMark = raw.includes("?") || raw.includes("ØŸ");
+  const hasQuestionToken = tokens.some((tok) => QUESTION_TOKENS.has(tok));
+  const explicitQuestion = hasQuestionMark || hasQuestionToken;
+
+  const explicitNegative = tokens.some((tok) => NEGATIVE_TOKENS.has(tok));
+
+  let negatedPositive = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const tok = tokens[index];
+    if (!NEGATION_TOKENS.has(tok)) continue;
+    const windowTokens = tokens.slice(index + 1, index + 4);
+    if (windowTokens.some((candidate) => POSITIVE_TOKENS.has(candidate))) {
+      negatedPositive = true;
+      break;
+    }
+  }
+
+  let scores = normalizeScoreMap(predictedClass, confidence, allScores);
+  const appliedRules = [];
+
+  if (negatedPositive) {
+    scores = boostClass(scores, "negative", 0.8);
+    appliedRules.push("negation_over_positive_pattern");
+  } else if (explicitNegative) {
+    scores = boostClass(scores, "negative", 0.7);
+    appliedRules.push("explicit_negative_lexicon");
+  } else if (explicitQuestion) {
+    scores = boostClass(scores, "question", 0.7);
+    appliedRules.push("question_cue");
+  }
+
+  const calibratedClass = Object.keys(scores).reduce((best, cls) => {
+    if (!best) return cls;
+    return Number(scores[cls] || 0) > Number(scores[best] || 0) ? cls : best;
+  }, "neutral");
+
+  return {
+    predictedClass: calibratedClass,
+    confidence: Number(scores[calibratedClass] || 0),
+    allScores: scores,
+    calibrationRules: appliedRules,
+  };
+}
+
+function mockRuleClassify(text) {
+  const normalized = String(text || "").toLowerCase();
+  const patterns = [
+    { cls: "negative", keys: ["mauvais", "trop cher", "khayeb", "Ø±Ø¯ÙŠØ¡", "bad", "zero", "ghali"] },
+    { cls: "improvement", keys: ["ameliore", "improve", "suggest", "Ø§Ù‚ØªØ±Ø§Ø­", "Ù…Ù…ÙƒÙ†", "please add"] },
+    { cls: "question", keys: ["?", "ou", "where", "wach", "ÙÙŠÙ†", "comment", "kayen"] },
+    { cls: "positive", keys: ["excellent", "top", "bnin", "tres bon", "Ø±ÙˆØ¹Ø©", "love", "super"] },
+  ];
+
+  let predicted = "neutral";
+  for (const rule of patterns) {
+    if (rule.keys.some((key) => normalized.includes(key))) {
+      predicted = rule.cls;
+    }
+  }
+
+  const baseScores = {
+    positive: 0.18,
+    negative: 0.18,
+    neutral: 0.18,
+    improvement: 0.18,
+    question: 0.18,
+  };
+  baseScores[predicted] = 0.66;
+  if (predicted === "question") baseScores.improvement = 0.11;
+
+  const calibrated = applyRuleCalibration(text, predicted, Number(baseScores[predicted] || 0.66), baseScores);
+  return {
+    text,
+    predicted_class: calibrated.predictedClass,
+    confidence: calibrated.confidence,
+    all_scores: calibrated.allScores,
+    calibration_rules: calibrated.calibrationRules,
+  };
+}
+
+async function predictWithLlmProvider(comments) {
+  const url = String(process.env.LLM_API_URL || "").trim();
+  if (!url) {
+    throw new Error("LLM_API_URL is not configured.");
+  }
+
+  const headers = { "Content-Type": "application/json" };
+  const apiKey = String(process.env.LLM_API_KEY || "").trim();
+  const apiKeyHeader = String(process.env.LLM_API_KEY_HEADER || "Authorization").trim();
+
+  if (apiKey) {
+    headers[apiKeyHeader] = apiKeyHeader.toLowerCase() === "authorization" && !apiKey.toLowerCase().startsWith("bearer ")
+      ? `Bearer ${apiKey}`
+      : apiKey;
+  }
+
+  const payload = {
+    model: String(process.env.LLM_MODEL || "").trim() || undefined,
+    task: "sentiment-classification",
+    target_classes: TARGET_CLASSES,
+    comments,
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+
+  const rawText = await response.text();
+  let data = {};
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch (error) {
+    throw new Error(`Invalid JSON returned by LLM API: ${error.message}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.detail || data?.error || `LLM API failed (${response.status})`);
+  }
+
+  const sourceRows = Array.isArray(data?.rows)
+    ? data.rows
+    : Array.isArray(data?.predictions)
+      ? data.predictions
+      : [];
+
+  if (!Array.isArray(sourceRows) || sourceRows.length !== comments.length) {
+    throw new Error("LLM API response must include rows[] matching the number of comments.");
+  }
+
+  return comments.map((text, index) => {
+    const row = sourceRows[index] || {};
+    const rawPred = String(row.predicted_class || row.label || "neutral").toLowerCase();
+    const rawConfidence = Number(row.confidence ?? row.score ?? 0.5);
+    const calibrated = applyRuleCalibration(text, rawPred, rawConfidence, row.all_scores || null);
+    return {
+      text,
+      predicted_class: calibrated.predictedClass,
+      confidence: calibrated.confidence,
+      all_scores: calibrated.allScores,
+      calibration_rules: calibrated.calibrationRules,
+    };
+  });
+}
+
+async function predictComments(comments) {
+  const provider = String(process.env.CLASSIFIER_PROVIDER || "rule").trim().toLowerCase();
+  if (provider === "llm") {
+    try {
+      return await predictWithLlmProvider(comments);
+    } catch (error) {
+      return comments.map((text) => ({
+        ...mockRuleClassify(text),
+        provider_error: String(error.message || error),
+      }));
+    }
+  }
+
+  return comments.map((text) => mockRuleClassify(text));
+}
+
+function classifyCatalog(product, text = "") {
+  const source = `${product || ""} ${text || ""}`.toLowerCase();
+
+  if (source.includes("milky")) {
+    if (/\b1\s?l\b|\b1l\b/.test(source)) return ["Boisson au lait", "milky : 1l"];
+    if (/\b20\s?cl\b|\b20cl\b/.test(source)) return ["Boisson au lait", "milky : 20cl"];
+    if (/\b300\s?ml\b|\b300ml\b/.test(source)) return ["Boisson au lait", "milky : 300ml"];
+    if (/\b25\s?cl\b|\b25cl\b/.test(source)) return ["Boisson au lait", "milky : 25cl"];
+    return ["Boisson au lait", "milky : 1l"];
+  }
+
+  if (["lait", "yupty", "raib", "lben", "cherebt", "duo"].some((key) => source.includes(key))) {
+    if (source.includes("yupty")) return ["Produits laitiers", "yupty"];
+    if (source.includes("raib") || source.includes("lben")) return ["Produits laitiers", "raib et lben"];
+    if (source.includes("cherebt")) return ["Produits laitiers", "cherebt"];
+    if (source.includes("duo")) return ["Produits laitiers", "ramy up duo"];
+    return ["Produits laitiers", "lais"];
+  }
+
+  if (["gaze", "gaz", "sparkling", "verre", "water fruits"].some((key) => source.includes(key))) {
+    if (source.includes("canette")) return ["Boisson gazÃ©ifiÃ©e", "Boisson gazeifiÃ©e canette"];
+    if (source.includes("verre")) return ["Boisson gazÃ©ifiÃ©e", "Boisson gazeifiÃ©e verre"];
+    return ["Boisson gazÃ©ifiÃ©e", "Water Fruits"];
+  }
+
+  if (source.includes("frutty")) return ["Boisson aux fruits", "Frutty"];
+  if (source.includes("kids")) return ["Boisson aux fruits", "kids"];
+  if (source.includes("canette")) return ["Boisson aux fruits", "canette"];
+  if (source.includes("carton") || source.includes("fardeau") || source.includes("pack")) return ["Boisson aux fruits", "carton"];
+  if (source.includes("extra")) return ["Boisson aux fruits", "EXTRA"];
+
+  return ["Boisson aux fruits", "Classique"];
+}
+
+function normalizeLegacyRow(parts) {
+  const text = String(parts[0] || "").trim();
+  const product = String(parts[1] || "").trim();
+  const label = String(parts[2] || "").trim().toLowerCase();
+  if (!text || !label) return null;
+
+  const [category, subcategory] = classifyCatalog(product, text);
+  return {
+    text,
+    product: product || "Unknown",
+    sentiment: label,
+    platform: "dataset",
+    wilaya: "ØºÙŠØ± Ù…Ø­Ø¯Ø¯",
+    rating: 3,
+    timestamp: new Date().toISOString(),
+    aspects: {},
+    category,
+    subcategory,
+  };
+}
+
+async function loadReviews() {
+  const dataPath = resolveDataPath();
+
+  if (!fsSync.existsSync(dataPath)) {
+    throw new Error(`Dataset file not found: ${dataPath}`);
+  }
+
+  const stats = await fs.stat(dataPath);
+  if (reviewCache.path === dataPath && reviewCache.mtimeMs === stats.mtimeMs) {
+    return reviewCache.rows;
+  }
+
+  const content = await fs.readFile(dataPath, "utf-8");
+  const parsed = Papa.parse(content, {
+    delimiter: ";",
+    skipEmptyLines: true,
+  });
+
+  const dataRows = Array.isArray(parsed.data) ? parsed.data : [];
+  if (!dataRows.length) return [];
+
+  const first = Array.isArray(dataRows[0]) ? dataRows[0] : [];
+  const lowered = first.map((cell) => String(cell || "").trim().toLowerCase());
+  const hasHeader = lowered.includes("text") && lowered.includes("product") && (lowered.includes("label") || lowered.includes("sentiment"));
+
+  const rows = [];
+  if (hasHeader) {
+    const header = lowered;
+    for (const record of dataRows.slice(1)) {
+      if (!Array.isArray(record) || !record.length) continue;
+      const row = {};
+      for (let index = 0; index < header.length; index += 1) {
+        row[header[index]] = String(record[index] ?? "").trim();
+      }
+
+      const text = String(row.text || "").trim();
+      const sentiment = String(row.sentiment || row.label || "").trim().toLowerCase();
+      if (!text || !sentiment) continue;
+
+      const product = String(row.product || "Unknown");
+      const [category, subcategory] = classifyCatalog(product, text);
+
+      let aspects = {};
+      if (row.aspects) {
+        try {
+          const parsedAspects = JSON.parse(row.aspects);
+          if (parsedAspects && typeof parsedAspects === "object") aspects = parsedAspects;
+        } catch {
+          aspects = {};
+        }
+      }
+
+      rows.push({
+        text,
+        product,
+        sentiment,
+        platform: row.platform || "dataset",
+        wilaya: row.wilaya || "ØºÙŠØ± Ù…Ø­Ø¯Ø¯",
+        rating: Number(row.rating || 3),
+        timestamp: row.timestamp || new Date().toISOString(),
+        aspects,
+        category: row.category || category,
+        subcategory: row.subcategory || subcategory,
+      });
+    }
+  } else {
+    for (const record of dataRows) {
+      if (!Array.isArray(record)) continue;
+      const normalized = normalizeLegacyRow(record);
+      if (normalized) rows.push(normalized);
+    }
+  }
+
+  reviewCache.path = dataPath;
+  reviewCache.mtimeMs = stats.mtimeMs;
+  reviewCache.rows = rows;
+  return rows;
+}
+
+function filterReviews(reviews, filters) {
+  let filtered = reviews;
+
+  const matchEq = (field, value) => {
+    const target = String(value || "").trim().toLowerCase();
+    if (!target) return;
+    filtered = filtered.filter((row) => String(row[field] || "").trim().toLowerCase() === target);
+  };
+
+  matchEq("sentiment", filters.sentiment);
+  matchEq("product", filters.product);
+  matchEq("wilaya", filters.wilaya);
+  matchEq("category", filters.category);
+  matchEq("subcategory", filters.subcategory);
+
+  if (filters.search) {
+    const needle = String(filters.search || "").trim().toLowerCase();
+    if (needle) {
+      filtered = filtered.filter((row) => String(row.text || "").toLowerCase().includes(needle));
+    }
+  }
+
+  return filtered;
+}
+
+function buildOverview(reviews) {
+  const sentiments = {};
+  const products = {};
+  const categories = {};
+
+  for (const review of reviews) {
+    const sentiment = String(review.sentiment || "unknown");
+    const product = String(review.product || "Unknown");
+    const category = String(review.category || "Unknown");
+
+    sentiments[sentiment] = (sentiments[sentiment] || 0) + 1;
+    products[product] = (products[product] || 0) + 1;
+    categories[category] = (categories[category] || 0) + 1;
+  }
+
+  const sortedProducts = Object.entries(products)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .reduce((acc, [key, value]) => {
+      acc[key] = value;
+      return acc;
+    }, {});
+
+  const recent = [...reviews].slice(-10).reverse();
+
+  return {
+    total: reviews.length,
+    distribution: sentiments,
+    products: sortedProducts,
+    categories,
+    recent,
+  };
+}
+
+function buildTrends(reviews) {
+  const trend = new Map();
+
+  for (const row of reviews) {
+    const ts = String(row.timestamp || "");
+    const date = Number.isNaN(Date.parse(ts)) ? new Date() : new Date(ts);
+    const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+
+    if (!trend.has(month)) trend.set(month, {});
+    const bucket = trend.get(month);
+    const sentiment = String(row.sentiment || "unknown");
+    bucket[sentiment] = (bucket[sentiment] || 0) + 1;
+  }
+
+  const series = Array.from(trend.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([month, counts]) => ({ month, ...counts }));
+
+  return { series };
+}
+
+function buildGeo(reviews) {
+  const buckets = new Map();
+
+  for (const row of reviews) {
+    const wilaya = String(row.wilaya || "ØºÙŠØ± Ù…Ø­Ø¯Ø¯");
+    if (!buckets.has(wilaya)) buckets.set(wilaya, {});
+    const item = buckets.get(wilaya);
+    const sentiment = String(row.sentiment || "unknown");
+    item[sentiment] = (item[sentiment] || 0) + 1;
+  }
+
+  const rows = [];
+  for (const [wilaya, counts] of buckets.entries()) {
+    const total = Object.values(counts).reduce((acc, value) => acc + Number(value || 0), 0);
+    const score = total
+      ? (((Number(counts.positive || 0) - Number(counts.negative || 0)) / total) * 100)
+      : 0;
+    rows.push({ wilaya, score: Number(score.toFixed(2)), total });
+  }
+
+  rows.sort((a, b) => b.score - a.score);
+  return {
+    rows,
+    best: rows[0] || null,
+    worst: rows.length ? rows[rows.length - 1] : null,
+  };
+}
+
+function buildAspects(reviews) {
+  const buckets = new Map();
+
+  for (const row of reviews) {
+    let aspects = row.aspects || {};
+    if (typeof aspects === "string") {
+      try {
+        aspects = JSON.parse(aspects);
+      } catch {
+        aspects = {};
+      }
+    }
+
+    if (!aspects || typeof aspects !== "object") continue;
+
+    for (const [aspect, sentiment] of Object.entries(aspects)) {
+      if (!buckets.has(aspect)) buckets.set(aspect, {});
+      const item = buckets.get(aspect);
+      item[sentiment] = (item[sentiment] || 0) + 1;
+    }
+  }
+
+  const rows = [];
+  for (const [aspect, counts] of buckets.entries()) {
+    const total = Object.values(counts).reduce((acc, value) => acc + Number(value || 0), 0);
+    if (!total) continue;
+    rows.push({
+      aspect,
+      positive: Number(counts.positive || 0),
+      negative: Number(counts.negative || 0),
+      neutral: Number(counts.neutral || 0),
+      score: Number((((Number(counts.positive || 0) - Number(counts.negative || 0)) / total) * 100).toFixed(2)),
+    });
+  }
+
+  rows.sort((a, b) => b.score - a.score);
+  return { rows };
+}
+
+function csvEscape(value) {
+  const text = String(value ?? "");
+  if (/[,;"\n\r]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function rowsToCsv(rows, headers, includeHeader = true, delimiter = ",") {
+  const lines = [];
+  if (includeHeader) {
+    lines.push(headers.map((header) => csvEscape(header)).join(delimiter));
+  }
+  for (const row of rows) {
+    lines.push(headers.map((header) => csvEscape(row?.[header] ?? "")).join(delimiter));
+  }
+  return lines.join("\n");
+}
+
+function detectLanguage(text) {
+  const value = String(text || "");
+  const hasArabic = /[\u0600-\u06FF]/.test(value);
+  const hasLatin = /[A-Za-z]/.test(value);
+  if (hasArabic && hasLatin) return "Mixed Arabic/Darja/French";
+  if (hasArabic) return "Arabic / Darja";
+  if (hasLatin) return "French / Latin";
+  return "Unknown";
+}
+
+function parseUploadedTable(file) {
+  const filename = String(file.originalname || "upload.csv").toLowerCase();
+  const buffer = file.buffer;
+
+  if (filename.endsWith(".xlsx") || filename.endsWith(".xls")) {
+    const workbook = XLSX.read(buffer, { type: "buffer" });
+    const firstSheet = workbook.SheetNames[0];
+    if (!firstSheet) {
+      throw new Error("Excel file does not contain any sheet.");
+    }
+    const sheet = workbook.Sheets[firstSheet];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    const columns = rows.length
+      ? Object.keys(rows[0])
+      : [];
+    return { rows, columns };
+  }
+
+  let text;
+  try {
+    text = buffer.toString("utf-8");
+  } catch {
+    text = buffer.toString("latin1");
+  }
+
+  const parsed = Papa.parse(text, {
+    header: true,
+    skipEmptyLines: true,
+    delimiter: "",
+  });
+
+  const headerFields = parsed.meta?.fields || [];
+  if (headerFields.length) {
+    return { rows: parsed.data, columns: headerFields };
+  }
+
+  const fallback = Papa.parse(text, {
+    header: false,
+    skipEmptyLines: true,
+    delimiter: "",
+  });
+
+  const matrix = Array.isArray(fallback.data) ? fallback.data : [];
+  const width = matrix.reduce((maxWidth, row) => Array.isArray(row) ? Math.max(maxWidth, row.length) : maxWidth, 0);
+  const columns = Array.from({ length: width }, (_, index) => `col_${index + 1}`);
+  const rows = matrix.map((row) => {
+    const payload = {};
+    for (let index = 0; index < width; index += 1) {
+      payload[columns[index]] = String((Array.isArray(row) ? row[index] : "") ?? "");
+    }
+    return payload;
+  });
+
+  return { rows, columns };
+}
+
+function resolveTextColumn(columns, rows, requestedColumn) {
+  const allColumns = Array.isArray(columns) ? columns.map((col) => String(col)) : [];
+  if (!allColumns.length) throw new Error("Uploaded file has no columns.");
+
+  if (requestedColumn) {
+    const target = String(requestedColumn).trim().toLowerCase();
+    const matched = allColumns.find((col) => col.trim().toLowerCase() === target);
+    if (!matched) {
+      throw new Error(`Text column '${requestedColumn}' not found in file.`);
+    }
+    return matched;
+  }
+
+  const candidates = ["text", "comment", "message", "review", "content", "feedback"];
+  for (const candidate of candidates) {
+    const matched = allColumns.find((col) => col.trim().toLowerCase() === candidate);
+    if (matched) return matched;
+  }
+
+  for (const col of allColumns) {
+    const hasText = rows.some((row) => {
+      const value = String(row?.[col] ?? "").trim();
+      return value.length > 0;
+    });
+    if (hasText) return col;
+  }
+
+  return allColumns[0];
+}
+
+async function ensureSocialConfig() {
+  try {
+    const raw = await fs.readFile(SOCIAL_CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      return parsed;
+    }
+  } catch {
+    // fallthrough to default config
+  }
+
+  const defaults = {
+    updated_at: new Date().toISOString(),
+    connectors: Object.fromEntries(SOCIAL_PLATFORMS.map((platform) => [
+      platform,
+      {
+        platform,
+        enabled: false,
+        page_id: "",
+        access_token: "",
+        verify_token: "",
+        webhook_url: `/api/social/webhook/${platform}`,
+      },
+    ])),
+  };
+
+  await fs.mkdir(path.dirname(SOCIAL_CONFIG_PATH), { recursive: true });
+  await fs.writeFile(SOCIAL_CONFIG_PATH, JSON.stringify(defaults, null, 2), "utf-8");
+  return defaults;
+}
+
+async function saveSocialConfig(config) {
+  const payload = { ...config, updated_at: new Date().toISOString() };
+  await fs.mkdir(path.dirname(SOCIAL_CONFIG_PATH), { recursive: true });
+  await fs.writeFile(SOCIAL_CONFIG_PATH, JSON.stringify(payload, null, 2), "utf-8");
+  return payload;
+}
+
+function maskSecret(secret) {
+  const value = String(secret || "");
+  if (!value) return "";
+  if (value.length <= 8) return "*".repeat(value.length);
+  return `${value.slice(0, 4)}${"*".repeat(value.length - 8)}${value.slice(-4)}`;
+}
+
+function sanitizeConnector(connector) {
+  const accessToken = String(connector.access_token || "");
+  const verifyToken = String(connector.verify_token || "");
+  return {
+    platform: connector.platform,
+    enabled: toBool(connector.enabled, false),
+    page_id: String(connector.page_id || ""),
+    webhook_url: String(connector.webhook_url || ""),
+    has_access_token: Boolean(accessToken),
+    access_token_masked: maskSecret(accessToken),
+    has_verify_token: Boolean(verifyToken),
+    verify_token_masked: maskSecret(verifyToken),
+  };
+}
+
+async function loadSocialRows() {
+  if (!fsSync.existsSync(SOCIAL_STREAM_PATH)) {
+    return [];
+  }
+
+  const content = await fs.readFile(SOCIAL_STREAM_PATH, "utf-8");
+  const parsed = Papa.parse(content, {
+    header: true,
+    skipEmptyLines: true,
+  });
+
+  const rows = Array.isArray(parsed.data) ? parsed.data : [];
+  rows.sort((a, b) => String(b.ingested_at || "").localeCompare(String(a.ingested_at || "")));
+  return rows;
+}
+
+const SOCIAL_STREAM_HEADERS = [
+  "id",
+  "platform",
+  "page_id",
+  "comment_id",
+  "author",
+  "text",
+  "predicted_class",
+  "confidence",
+  "timestamp",
+  "ingested_at",
+  "source",
+];
+
+async function appendSocialRows(rows) {
+  if (!rows.length) return;
+  await fs.mkdir(path.dirname(SOCIAL_STREAM_PATH), { recursive: true });
+  const exists = fsSync.existsSync(SOCIAL_STREAM_PATH);
+  const chunk = `${rowsToCsv(rows, SOCIAL_STREAM_HEADERS, !exists)}\n`;
+  await fs.appendFile(SOCIAL_STREAM_PATH, chunk, "utf-8");
+}
+
+function extractSocialComments(payload) {
+  const comments = [];
+
+  if (Array.isArray(payload?.comments)) {
+    for (const item of payload.comments) {
+      if (item && typeof item === "object") {
+        const text = String(item.text || item.message || "").trim();
+        if (!text) continue;
+        comments.push({
+          comment_id: String(item.id || item.comment_id || ""),
+          author: String(item.author || item.username || ""),
+          text,
+          timestamp: String(item.timestamp || new Date().toISOString()),
+        });
+      } else {
+        const text = String(item || "").trim();
+        if (!text) continue;
+        comments.push({
+          comment_id: "",
+          author: "",
+          text,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  if (Array.isArray(payload?.entry)) {
+    for (const entry of payload.entry) {
+      if (!entry || typeof entry !== "object") continue;
+      const changes = Array.isArray(entry.changes) ? entry.changes : [];
+      for (const change of changes) {
+        const value = change?.value;
+        if (!value || typeof value !== "object") continue;
+        const nestedComment = value.comment && typeof value.comment === "object" ? value.comment : {};
+        const text = String(value.message || value.text || nestedComment.message || "").trim();
+        if (!text) continue;
+        const sender = value.from && typeof value.from === "object" ? value.from : {};
+        comments.push({
+          comment_id: String(value.comment_id || value.id || ""),
+          author: String(sender.name || sender.id || ""),
+          text,
+          timestamp: String(value.created_time || value.timestamp || new Date().toISOString()),
+        });
+      }
+    }
+  }
+
+  if (Array.isArray(payload?.data)) {
+    for (const item of payload.data) {
+      if (!item || typeof item !== "object") continue;
+      const text = String(item.text || item.message || item.comment || "").trim();
+      if (!text) continue;
+      comments.push({
+        comment_id: String(item.id || item.comment_id || ""),
+        author: String(item.author || item.username || ""),
+        text,
+        timestamp: String(item.timestamp || new Date().toISOString()),
+      });
+    }
+  }
+
+  return comments;
+}
+
+async function ingestSocialComments(platform, pageId, comments, source = "api") {
+  const normalizedPlatform = String(platform || "").trim().toLowerCase();
+  if (!SOCIAL_PLATFORMS.includes(normalizedPlatform)) {
+    throw new Error(`Unsupported platform '${platform}'.`);
+  }
+
+  const cleaned = comments
+    .map((item) => ({
+      comment_id: String(item.comment_id || item.id || ""),
+      author: String(item.author || item.username || ""),
+      text: String(item.text || item.message || "").trim(),
+      timestamp: String(item.timestamp || new Date().toISOString()),
+    }))
+    .filter((item) => item.text);
+
+  if (!cleaned.length) {
+    throw new Error("No valid comments found for ingestion.");
+  }
+  if (cleaned.length > 500) {
+    throw new Error("Too many comments in one request. Max allowed is 500.");
+  }
+
+  const predictions = await predictComments(cleaned.map((row) => row.text));
+  const now = new Date().toISOString();
+
+  const streamRows = cleaned.map((row, index) => ({
+    id: crypto.randomUUID(),
+    platform: normalizedPlatform,
+    page_id: String(pageId || ""),
+    comment_id: row.comment_id,
+    author: row.author,
+    text: row.text,
+    predicted_class: predictions[index]?.predicted_class || "neutral",
+    confidence: Number(predictions[index]?.confidence || 0),
+    timestamp: row.timestamp || now,
+    ingested_at: now,
+    source,
+  }));
+
+  await appendSocialRows(streamRows);
+  const distribution = streamRows.reduce((acc, row) => {
+    const cls = String(row.predicted_class || "unknown");
+    acc[cls] = (acc[cls] || 0) + 1;
+    return acc;
+  }, {});
+
+  return {
+    platform: normalizedPlatform,
+    ingested: streamRows.length,
+    distribution,
+    rows: streamRows,
+  };
+}
+
+const asyncRoute = (handler) => (req, res, next) => {
+  Promise.resolve(handler(req, res, next)).catch(next);
+};
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    dataset: resolveDataPath(),
+  });
+});
+
+app.get("/api/model/status", (req, res) => {
+  const provider = String(process.env.CLASSIFIER_PROVIDER || "rule").toLowerCase();
+  res.json({
+    ready: true,
+    provider,
+    model_dir: provider === "llm" ? String(process.env.LLM_API_URL || "") : "rule-based-classifier",
+    error: "",
+    xai_ready: false,
+    xai_error: "XAI disabled in Node backend.",
+  });
+});
+
+app.get("/api/model/predict", (req, res) => {
+  res.json({
+    detail: "Method Not Allowed for GET. Use POST with JSON body: {'comments': ['text1', 'text2']}",
+    example: { comments: ["ramy tres bon", "prix trop cher"] },
+  });
+});
+
+app.post("/api/model/predict", asyncRoute(async (req, res) => {
+  const commentsRaw = req.body?.comments;
+  let comments = [];
+
+  if (typeof commentsRaw === "string") {
+    comments = commentsRaw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  } else if (Array.isArray(commentsRaw)) {
+    comments = commentsRaw.map((value) => String(value || "").trim()).filter(Boolean);
+  }
+
+  if (!comments.length) {
+    return res.status(400).json({ detail: "Provide at least one comment in 'comments'." });
+  }
+  if (comments.length > 1000) {
+    return res.status(400).json({ detail: "Too many comments. Max allowed is 1000." });
+  }
+
+  const rows = await predictComments(comments);
+  const distribution = rows.reduce((acc, row) => {
+    const cls = String(row.predicted_class || "unknown");
+    acc[cls] = (acc[cls] || 0) + 1;
+    return acc;
+  }, {});
+
+  res.json({
+    total: rows.length,
+    rows: rows.map((row) => ({
+      ...row,
+      language: detectLanguage(row.text),
+    })),
+    distribution,
+    model_dir: String(process.env.CLASSIFIER_PROVIDER || "rule"),
+    xai_used: false,
+    xai_method: "",
+    xai_error: "",
+  });
+}));
+
+app.post("/api/model/predict-file", upload.single("file"), asyncRoute(async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ detail: "File is required." });
+  }
+
+  const textColumn = String(req.body?.text_column || "").trim();
+  const outputFormat = String(req.body?.output_format || "json").trim().toLowerCase();
+
+  let table;
+  try {
+    table = parseUploadedTable(req.file);
+  } catch (error) {
+    return res.status(400).json({ detail: String(error.message || error) });
+  }
+
+  const rows = Array.isArray(table.rows) ? table.rows : [];
+  const columns = Array.isArray(table.columns) ? table.columns : [];
+  if (!rows.length) {
+    return res.status(400).json({ detail: "Uploaded file has no data rows." });
+  }
+
+  let selectedColumn;
+  try {
+    selectedColumn = resolveTextColumn(columns, rows, textColumn);
+  } catch (error) {
+    return res.status(400).json({ detail: String(error.message || error) });
+  }
+
+  const validIndices = [];
+  const comments = [];
+  rows.forEach((row, index) => {
+    const text = String(row?.[selectedColumn] ?? "").trim();
+    if (!text) return;
+    validIndices.push(index);
+    comments.push(text);
+  });
+
+  if (!comments.length) {
+    return res.status(400).json({ detail: "No valid text rows found in selected column." });
+  }
+  if (comments.length > 2000) {
+    return res.status(400).json({ detail: "Too many rows to analyze. Max allowed is 2000." });
+  }
+
+  const predictions = await predictComments(comments);
+  const outRows = rows.map((row) => ({ ...row }));
+  for (let i = 0; i < predictions.length; i += 1) {
+    const targetIndex = validIndices[i];
+    const pred = predictions[i];
+    outRows[targetIndex].predicted_class = pred.predicted_class;
+    outRows[targetIndex].confidence = Number(pred.confidence || 0);
+    outRows[targetIndex].calibration_rules = Array.isArray(pred.calibration_rules) ? pred.calibration_rules.join(",") : "";
+    outRows[targetIndex].all_scores_json = JSON.stringify(pred.all_scores || {});
+  }
+
+  const distribution = predictions.reduce((acc, row) => {
+    const cls = String(row.predicted_class || "unknown");
+    acc[cls] = (acc[cls] || 0) + 1;
+    return acc;
+  }, {});
+
+  const originalName = String(req.file.originalname || "predictions");
+  const baseName = originalName.replace(/\.[^.]+$/, "") || "predictions";
+
+  if (outputFormat === "csv") {
+    const headers = Array.from(outRows.reduce((acc, row) => {
+      Object.keys(row).forEach((key) => acc.add(key));
+      return acc;
+    }, new Set()));
+    const content = rowsToCsv(outRows, headers, true, ",");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename=${baseName}_predictions.csv`);
+    return res.send(content);
+  }
+
+  if (outputFormat === "xlsx") {
+    const sheet = XLSX.utils.json_to_sheet(outRows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, sheet, "predictions");
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=${baseName}_predictions.xlsx`);
+    return res.send(buffer);
+  }
+
+  return res.json({
+    filename: originalName,
+    text_column: selectedColumn,
+    total_rows: outRows.length,
+    analyzed_rows: predictions.length,
+    skipped_rows: outRows.length - predictions.length,
+    distribution,
+    prediction_preview: predictions.slice(0, 200),
+    table_preview: outRows.slice(0, 120),
+    available_columns: Array.from(outRows.reduce((acc, row) => {
+      Object.keys(row).forEach((key) => acc.add(key));
+      return acc;
+    }, new Set())),
+  });
+}));
+
+app.get("/api/catalog", (req, res) => {
+  res.json(CATALOG);
+});
+
+app.get("/api/options", asyncRoute(async (req, res) => {
+  const reviews = await loadReviews();
+  res.json({
+    products: [...new Set(reviews.map((row) => String(row.product || "Unknown")))].sort(),
+    sentiments: [...new Set(reviews.map((row) => String(row.sentiment || "unknown")))].sort(),
+    wilayas: [...new Set(reviews.map((row) => String(row.wilaya || "ØºÙŠØ± Ù…Ø­Ø¯Ø¯")))].sort(),
+    categories: [...new Set(reviews.map((row) => String(row.category || "")))].sort(),
+    subcategories: [...new Set(reviews.map((row) => String(row.subcategory || "")))].sort(),
+  });
+}));
+
+app.get("/api/overview", asyncRoute(async (req, res) => {
+  const reviews = await loadReviews();
+  const filtered = filterReviews(reviews, req.query || {});
+  res.json(buildOverview(filtered));
+}));
+
+app.get("/api/trends", asyncRoute(async (req, res) => {
+  const reviews = await loadReviews();
+  const filtered = filterReviews(reviews, req.query || {});
+  res.json(buildTrends(filtered));
+}));
+
+app.get("/api/geo", asyncRoute(async (req, res) => {
+  const reviews = await loadReviews();
+  const filtered = filterReviews(reviews, req.query || {});
+  res.json(buildGeo(filtered));
+}));
+
+app.get("/api/aspects", asyncRoute(async (req, res) => {
+  const reviews = await loadReviews();
+  const filtered = filterReviews(reviews, req.query || {});
+  res.json(buildAspects(filtered));
+}));
+
+app.get("/api/reviews", asyncRoute(async (req, res) => {
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.max(5, Math.min(100, Number(req.query.page_size || 20)));
+
+  const reviews = await loadReviews();
+  const filtered = filterReviews(reviews, req.query || {});
+
+  const total = filtered.length;
+  const start = (page - 1) * pageSize;
+  const end = start + pageSize;
+
+  res.json({
+    page,
+    page_size: pageSize,
+    total,
+    pages: Math.max(1, Math.ceil(total / pageSize)),
+    rows: filtered.slice(start, end),
+  });
+}));
+
+app.get("/api/export/reviews.csv", asyncRoute(async (req, res) => {
+  const reviews = await loadReviews();
+  const filtered = filterReviews(reviews, req.query || {});
+
+  const headers = [
+    "text",
+    "product",
+    "category",
+    "subcategory",
+    "sentiment",
+    "platform",
+    "wilaya",
+    "rating",
+    "timestamp",
+  ];
+  const content = rowsToCsv(filtered, headers, true, ";");
+  const filename = `ramy_reviews_export_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+  res.send(content);
+}));
+
+app.get("/api/social/connectors", asyncRoute(async (req, res) => {
+  const config = await ensureSocialConfig();
+  const connectors = config.connectors || {};
+  const sanitized = SOCIAL_PLATFORMS.map((platform) => sanitizeConnector(connectors[platform] || {
+    platform,
+    enabled: false,
+    page_id: "",
+    access_token: "",
+    verify_token: "",
+    webhook_url: `/api/social/webhook/${platform}`,
+  }));
+
+  res.json({
+    updated_at: config.updated_at || "",
+    connectors: sanitized,
+  });
+}));
+
+app.post("/api/social/connectors", asyncRoute(async (req, res) => {
+  const platform = String(req.body?.platform || "").trim().toLowerCase();
+  if (!SOCIAL_PLATFORMS.includes(platform)) {
+    return res.status(400).json({ detail: `Unsupported platform '${platform}'.` });
+  }
+
+  const config = await ensureSocialConfig();
+  if (!config.connectors || typeof config.connectors !== "object") {
+    config.connectors = {};
+  }
+
+  const existing = config.connectors[platform] || {
+    platform,
+    enabled: false,
+    page_id: "",
+    access_token: "",
+    verify_token: "",
+    webhook_url: `/api/social/webhook/${platform}`,
+  };
+
+  existing.platform = platform;
+  existing.enabled = toBool(req.body?.enabled, existing.enabled);
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, "page_id")) {
+    existing.page_id = String(req.body.page_id || "");
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, "access_token")) {
+    existing.access_token = String(req.body.access_token || "");
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, "verify_token")) {
+    existing.verify_token = String(req.body.verify_token || "");
+  }
+  existing.webhook_url = `/api/social/webhook/${platform}`;
+
+  config.connectors[platform] = existing;
+  const saved = await saveSocialConfig(config);
+
+  res.json({
+    status: "saved",
+    updated_at: saved.updated_at,
+    connector: sanitizeConnector(existing),
+  });
+}));
+
+app.post("/api/social/ingest", asyncRoute(async (req, res) => {
+  const platform = String(req.body?.platform || "facebook").trim().toLowerCase();
+  const pageId = String(req.body?.page_id || "");
+  const source = String(req.body?.source || "api");
+  const commentsInput = Array.isArray(req.body?.comments) ? req.body.comments : null;
+
+  if (!commentsInput) {
+    return res.status(400).json({ detail: "'comments' must be an array." });
+  }
+
+  try {
+    const result = await ingestSocialComments(platform, pageId, commentsInput, source);
+    const rows = await loadSocialRows();
+    res.json({
+      ...result,
+      stream_total: rows.length,
+      rows: result.rows.slice(0, 120),
+    });
+  } catch (error) {
+    res.status(400).json({ detail: String(error.message || error) });
+  }
+}));
+
+app.get("/api/social/comments", asyncRoute(async (req, res) => {
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 100)));
+  const platform = String(req.query.platform || "").trim().toLowerCase();
+  const pageId = String(req.query.page_id || "").trim().toLowerCase();
+
+  let rows = await loadSocialRows();
+  if (platform) {
+    rows = rows.filter((row) => String(row.platform || "").toLowerCase() === platform);
+  }
+  if (pageId) {
+    rows = rows.filter((row) => String(row.page_id || "").toLowerCase() === pageId);
+  }
+
+  const distribution = rows.reduce((acc, row) => {
+    const cls = String(row.predicted_class || "unknown");
+    acc[cls] = (acc[cls] || 0) + 1;
+    return acc;
+  }, {});
+
+  res.json({
+    total: rows.length,
+    distribution,
+    rows: rows.slice(0, limit),
+  });
+}));
+
+app.get("/api/social/export.csv", asyncRoute(async (req, res) => {
+  const platform = String(req.query.platform || "").trim().toLowerCase();
+  const pageId = String(req.query.page_id || "").trim().toLowerCase();
+
+  let rows = await loadSocialRows();
+  if (platform) rows = rows.filter((row) => String(row.platform || "").toLowerCase() === platform);
+  if (pageId) rows = rows.filter((row) => String(row.page_id || "").toLowerCase() === pageId);
+
+  const content = rowsToCsv(rows, SOCIAL_STREAM_HEADERS, true, ",");
+  const filename = `ramy_social_stream_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+  res.send(content);
+}));
+
+app.get("/api/social/export.xlsx", asyncRoute(async (req, res) => {
+  const platform = String(req.query.platform || "").trim().toLowerCase();
+  const pageId = String(req.query.page_id || "").trim().toLowerCase();
+
+  let rows = await loadSocialRows();
+  if (platform) rows = rows.filter((row) => String(row.platform || "").toLowerCase() === platform);
+  if (pageId) rows = rows.filter((row) => String(row.page_id || "").toLowerCase() === pageId);
+
+  const workbook = XLSX.utils.book_new();
+  const sheet = XLSX.utils.json_to_sheet(rows);
+  XLSX.utils.book_append_sheet(workbook, sheet, "social_stream");
+  const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  const filename = `ramy_social_stream_${new Date().toISOString().replace(/[:.]/g, "-")}.xlsx`;
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+  res.send(buffer);
+}));
+
+app.get("/api/social/webhook/:platform", asyncRoute(async (req, res) => {
+  const platform = String(req.params.platform || "").trim().toLowerCase();
+  if (!SOCIAL_PLATFORMS.includes(platform)) {
+    return res.status(404).json({ detail: "Unknown platform webhook." });
+  }
+
+  const mode = String(req.query["hub.mode"] || "");
+  const verifyToken = String(req.query["hub.verify_token"] || "");
+  const challenge = String(req.query["hub.challenge"] || "");
+
+  const config = await ensureSocialConfig();
+  const connector = config.connectors?.[platform] || {};
+  const expected = String(connector.verify_token || "");
+
+  if (mode === "subscribe" && challenge) {
+    if (expected && verifyToken === expected) {
+      res.setHeader("Content-Type", "text/plain");
+      return res.send(challenge);
+    }
+    return res.status(403).json({ detail: "Webhook verification failed." });
+  }
+
+  return res.json({ status: "ok", platform });
+}));
+
+app.post("/api/social/webhook/:platform", asyncRoute(async (req, res) => {
+  const platform = String(req.params.platform || "").trim().toLowerCase();
+  if (!SOCIAL_PLATFORMS.includes(platform)) {
+    return res.status(404).json({ detail: "Unknown platform webhook." });
+  }
+
+  const comments = extractSocialComments(req.body || {});
+  if (!comments.length) {
+    return res.json({
+      platform,
+      ingested: 0,
+      distribution: {},
+      rows: [],
+      detail: "No comment text found in webhook payload.",
+    });
+  }
+
+  try {
+    const pageId = String(req.body?.page_id || req.body?.object_id || "");
+    const result = await ingestSocialComments(platform, pageId, comments, "webhook");
+    return res.json({ ...result, rows: result.rows.slice(0, 120) });
+  } catch (error) {
+    return res.status(400).json({ detail: String(error.message || error) });
+  }
+}));
+
+app.use("/api", (req, res) => {
+  res.status(404).json({ detail: "Not Found" });
+});
+
+app.use((error, req, res, next) => {
+  const statusCode = Number(error?.statusCode || error?.status || 500);
+  const detail = String(error?.message || "Internal server error");
+  res.status(statusCode).json({ detail });
+});
+
+const port = Number(process.env.PORT || 8000);
+app.listen(port, () => {
+  console.log(`Ramy Node backend running on http://127.0.0.1:${port}`);
+});
