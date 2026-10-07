@@ -1,4 +1,4 @@
-﻿import crypto from "crypto";
+import crypto from "crypto";
 import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
@@ -74,13 +74,8 @@ function getAllowedCorsOrigins() {
 
 const allowedCorsOrigins = getAllowedCorsOrigins();
 const corsOptions = {
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedCorsOrigins.includes("*") || allowedCorsOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(null, false);
-  },
+  origin: true,
+  credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   optionsSuccessStatus: 204,
@@ -367,25 +362,30 @@ function buildRuleXai(text, predictedClass, topK = 8) {
   };
 }
 
-function normalizeTopTokens(rawTokens, topK = 8) {
+function normalizeTopTokens(rawTokens, text = "", topK = 8) {
   if (!Array.isArray(rawTokens)) return [];
+
+  const textLower = String(text || "").toLowerCase();
+  const validTokensInText = new Set(extractTextTokens(text));
 
   const normalized = [];
   for (const entry of rawTokens) {
+    let token = "";
+    let score = 0;
     if (Array.isArray(entry) && entry.length >= 2) {
-      const token = String(entry[0] || "").trim();
-      const score = Number(entry[1]);
-      if (token && Number.isFinite(score) && score >= 0) {
-        normalized.push([token, score]);
-      }
-      continue;
+      token = String(entry[0] || "").trim();
+      score = Number(entry[1]);
+    } else if (entry && typeof entry === "object") {
+      token = String(entry.token || entry.word || "").trim();
+      score = Number(entry.score ?? entry.weight ?? entry.value ?? 0);
     }
-    if (entry && typeof entry === "object") {
-      const token = String(entry.token || entry.word || "").trim();
-      const score = Number(entry.score ?? entry.weight ?? entry.value ?? 0);
-      if (token && Number.isFinite(score) && score >= 0) {
-        normalized.push([token, score]);
-      }
+
+    if (!token || !Number.isFinite(score) || score < 0) continue;
+
+    const tokenLower = token.toLowerCase();
+    // Validate that token exists in original comment text
+    if (!textLower || validTokensInText.has(tokenLower) || textLower.includes(tokenLower)) {
+      normalized.push([token, score]);
     }
   }
 
@@ -422,12 +422,16 @@ function extractJsonObject(text) {
 
 function buildLlmPrompt(text, includeXai = false, topK = 8) {
   const xaiInstruction = includeXai
-    ? `Also include top_tokens as an array of [token, score] with ${topK} items max, and explanation_text in one short sentence.`
+    ? `CRITICAL for top_tokens: MUST be an array of [token, score] containing ONLY words extracted directly from the Comment text verbatim (do NOT translate words into Arabic if the comment is Latin/French/Arabizi, do NOT add or hallucinate words not in the Comment). If the comment has 2 words, return at most 2 tokens. For off-topic comments return []. Scores should be relative importance between 0 and 1. Also include explanation_text in one short sentence.`
     : "Set top_tokens to [] and explanation_text to ''.";
 
   return [
-    "You are a strict JSON API for sentiment classification of Algerian Arabic, Darija, and French mixed customer comments.",
+    "You are a strict JSON API for enterprise sentiment intelligence exclusively for RAMY (Algerian beverage company: juices, drinks, sodas, dairy, water).",
     `Valid predicted_class values: ${TARGET_CLASSES.join(", ")}.`,
+    "DOMAIN RELEVANCE RULE (CRITICAL):",
+    "- You MUST only evaluate sentiment and questions specifically directed at Ramy, its products (juice, drinks, milk, water, packaging, price, taste, availability), or related customer feedback.",
+    "- If the comment is off-topic, general, or unrelated to Ramy and its products (e.g. general political slogans like 'i love palestine', personal statements, greetings, or topics not about Ramy), you MUST classify it as 'neutral' with confidence >= 0.90.",
+    "- For off-topic comments, set explanation_text to: 'Comment is unrelated to Ramy products or brand.' and top_tokens to [].",
     "Return JSON only with keys: predicted_class, confidence, all_scores, top_tokens, explanation_text, xai_method.",
     "all_scores must include exactly these classes and sum approximately to 1.",
     xaiInstruction,
@@ -438,16 +442,26 @@ function buildLlmPrompt(text, includeXai = false, topK = 8) {
 function normalizeLlmPrediction(text, rawRow, options, providerId) {
   const rawPred = String(rawRow?.predicted_class || rawRow?.label || "neutral").toLowerCase();
   const rawConfidence = Number(rawRow?.confidence ?? rawRow?.score ?? 0.5);
-  const calibrated = applyRuleCalibration(text, rawPred, rawConfidence, rawRow?.all_scores || null);
+  const isOffTopic = String(rawRow?.explanation_text || "").toLowerCase().includes("unrelated to ramy")
+    || String(rawRow?.explanation_text || "").toLowerCase().includes("off-topic");
+
+  const calibrated = isOffTopic
+    ? {
+        predictedClass: "neutral",
+        confidence: Math.max(0.9, rawConfidence),
+        allScores: { positive: 0.02, negative: 0.02, neutral: 0.92, improvement: 0.02, question: 0.02 },
+        calibrationRules: ["off_topic_guard"],
+      }
+    : applyRuleCalibration(text, rawPred, rawConfidence, rawRow?.all_scores || null);
 
   let topTokens = [];
-  let explanationText = "";
-  let xaiMethod = "";
+  let explanationText = String(rawRow?.explanation_text || "").trim();
+  let xaiMethod = String(rawRow?.xai_method || "").trim() || `llm-${providerId}`;
 
-  if (options.includeXai) {
-    topTokens = normalizeTopTokens(rawRow?.top_tokens || rawRow?.word_attributions || [], options.xaiTopK);
-    explanationText = String(rawRow?.explanation_text || "").trim();
-    xaiMethod = String(rawRow?.xai_method || "").trim() || `llm-${providerId}`;
+  if (isOffTopic) {
+    if (!explanationText) explanationText = "Comment is unrelated to Ramy products or brand.";
+  } else if (options.includeXai) {
+    topTokens = normalizeTopTokens(rawRow?.top_tokens || rawRow?.word_attributions || [], text, options.xaiTopK);
 
     if (!topTokens.length) {
       const fallbackXai = buildRuleXai(text, calibrated.predictedClass, options.xaiTopK);
@@ -472,16 +486,22 @@ function normalizeLlmPrediction(text, rawRow, options, providerId) {
 
 function buildLlmProviderChain() {
   const providers = [];
-  const onlyGemini = toBool(process.env.LLM_ONLY_GEMINI, true);
+  const onlyGemini = toBool(process.env.LLM_ONLY_GEMINI, false);
 
   const geminiPrimary = String(process.env.GEMINI_API_KEY_PRIMARY || "").trim();
   const geminiSecondary = String(process.env.GEMINI_API_KEY_SECONDARY || "").trim();
   const grokKey = String(process.env.GROK_API_KEY || "").trim();
+  const nvidiaKey = String(process.env.NVIDIA_API_KEY || "").trim();
 
   const geminiModelPrimary = String(process.env.GEMINI_MODEL_PRIMARY || process.env.GEMINI_MODEL || "gemini-1.5-flash").trim();
   const geminiModelSecondary = String(process.env.GEMINI_MODEL_SECONDARY || process.env.GEMINI_MODEL || "gemini-1.5-flash").trim();
-  const grokModel = String(process.env.GROK_MODEL || "grok-2-latest").trim();
+  const grokModel = String(process.env.GROK_MODEL || "llama-3.3-70b-versatile").trim();
+  const nvidiaModel = String(process.env.NVIDIA_MODEL || "meta/llama-3.2-11b-vision-instruct").trim();
+  const nvidiaUrl = String(process.env.NVIDIA_API_URL || "https://integrate.api.nvidia.com/v1/chat/completions").trim();
 
+  if (nvidiaKey) {
+    providers.push({ id: "nvidia", type: "nvidia", apiKey: nvidiaKey, model: nvidiaModel, url: nvidiaUrl });
+  }
   if (geminiPrimary) {
     providers.push({ id: "gemini-primary", type: "gemini", apiKey: geminiPrimary, model: geminiModelPrimary });
   }
@@ -495,6 +515,19 @@ function buildLlmProviderChain() {
   const customUrl = String(process.env.LLM_API_URL || "").trim();
   if (!onlyGemini && customUrl) {
     providers.push({ id: "custom", type: "custom", url: customUrl });
+  }
+
+  const preferredProvider = String(process.env.LLM_PREFERRED_PROVIDER || "").trim().toLowerCase();
+  if (preferredProvider) {
+    const rank = (provider) => {
+      if (preferredProvider === provider.id || preferredProvider === provider.type) return 0;
+      if (preferredProvider === "nvidia" && provider.type === "nvidia") return 0;
+      if (preferredProvider === "grok" && provider.type === "grok") return 0;
+      if (preferredProvider === "gemini" && provider.type === "gemini") return 0;
+      if (preferredProvider === "custom" && provider.type === "custom") return 0;
+      return 1;
+    };
+    providers.sort((a, b) => rank(a) - rank(b));
   }
 
   return providers;
@@ -646,7 +679,58 @@ async function callCustomProvider(provider, text, options) {
   return row;
 }
 
+async function callNvidiaProvider(provider, text, options) {
+  const endpoint = String(provider.url || process.env.NVIDIA_API_URL || "https://integrate.api.nvidia.com/v1/chat/completions").trim();
+  const prompt = buildLlmPrompt(text, options.includeXai, options.xaiTopK);
+  const timeoutMs = readEnvInt("LLM_PROVIDER_TIMEOUT_MS", 30_000, 1_000, 180_000);
+
+  const response = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${provider.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: "You only return strict JSON responses." },
+        { role: "user", content: prompt },
+      ],
+    }),
+  }, timeoutMs);
+
+  const bodyText = await response.text();
+  let payload = {};
+  try {
+    payload = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    // Keep raw body fallback.
+  }
+
+  if (!response.ok) {
+    const detail = payload?.error?.message || payload?.detail || `NVIDIA failed (${response.status})`;
+    const err = new Error(detail);
+    err.status = response.status;
+    const retryAfterMs = Math.max(
+      parseRetryAfterHeader(response.headers.get("retry-after")),
+      parseRetryDelayFromMessage(detail),
+    );
+    throw attachProviderErrorMetadata(err, provider.id, retryAfterMs);
+  }
+
+  const contentText = payload?.choices?.[0]?.message?.content;
+  if (!contentText) {
+    const err = new Error("NVIDIA response is missing message content.");
+    err.status = response.status;
+    throw err;
+  }
+
+  return extractJsonObject(contentText);
+}
+
 async function callLlmProvider(provider, text, options) {
+  if (provider.type === "nvidia") return callNvidiaProvider(provider, text, options);
   if (provider.type === "gemini") return callGeminiProvider(provider, text, options);
   if (provider.type === "grok") return callGrokProvider(provider, text, options);
   return callCustomProvider(provider, text, options);
@@ -1438,7 +1522,7 @@ app.get("/api/model/status", (req, res) => {
     provider,
     llm_chain: llmChain,
     model_dir: provider === "llm" ? llmChain.join(" -> ") : "rule-based-classifier",
-    error: ready ? "" : "No LLM provider configured. Add Gemini/Grok keys in backend .env",
+    error: ready ? "" : "No LLM provider configured. Add Gemini/Grok/NVIDIA keys in backend .env",
     xai_ready: provider === "llm",
     xai_error: provider === "llm" ? "" : "XAI is only enabled for LLM provider mode.",
   });
